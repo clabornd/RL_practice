@@ -12,19 +12,19 @@ def discretize(obs, range):
     onehot = tf.one_hot(np.digitize(obs, range) - 1, len(range)).numpy()
     return(onehot)
 
-def mlp(input_shape, sizes, activation=tf.nn.tanh, output_activation=None, dropout=None):
+def mlp(input_shape, sizes, activation=tf.nn.tanh, output_activation=None, dropout=None, **kwargs):
     input = tf.keras.Input(input_shape)
     if dropout is None:  dropout = [None]*len(sizes)
 
     # Build a feedforward neural network.
     for i, size in enumerate(sizes):
         if len(sizes) > 1 and i == 0:
-            x = tf.keras.layers.Dense(units=size, activation=activation)(input)
+            x = tf.keras.layers.Dense(units=size, activation=activation, **kwargs)(input)
         elif len(sizes) == 1:
-            x = tf.keras.layers.Dense(units=size, activation=output_activation)(input)
+            x = tf.keras.layers.Dense(units=size, activation=output_activation, **kwargs)(input)
         else:
             activation = activation if i != len(sizes)-1 else output_activation
-            x = tf.keras.layers.Dense(units=size, activation=activation)(x)
+            x = tf.keras.layers.Dense(units=size, activation=activation, **kwargs)(x)
 
         if dropout[i] is not None:
             x = tf.keras.layers.Dropout(dropout[i])(x)
