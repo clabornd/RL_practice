@@ -11,8 +11,8 @@ speed_bins = 30
 obs_dim = pos_bins+speed_bins
 n_acts = env.action_space.n
 
-Q1 = mlp(obs_dim, [n_acts], dropout=[None])
-Q2 = mlp(obs_dim, [n_acts], dropout=[None])
+Q1 = mlp(obs_dim, [200, n_acts], dropout=None, use_bias=False)
+Q2 = mlp(obs_dim, [200, n_acts], dropout=None, use_bias=False)
 
 Q1_opt = tf.optimizers.Adam(learning_rate=cfg.learning_rate)
 Q2_opt = tf.optimizers.Adam(learning_rate=cfg.learning_rate)
@@ -36,6 +36,8 @@ def train_step(Q1, Q1_opt, Q2, Q2_opt, epsilon):
     collect_Q2_loss = 0 #
     iteration = 0
     batch_acts = []  # store actions
+    batch_rews = []  # store rewards
+    batch_obs = [] # store observations
     batch_rets = []  # store episode returns
     batch_lens = []  # store episode lengths
     batch_velocity = [] # store the absolute speed over the train step
@@ -47,7 +49,6 @@ def train_step(Q1, Q1_opt, Q2, Q2_opt, epsilon):
     ep_obs = []
     ep_acts = []
     ep_velocity = []
-    which_network = np.random.binomial(1, 0.5) # switch which network we are updating
 
     # generate an episode
     while not done:
@@ -60,7 +61,7 @@ def train_step(Q1, Q1_opt, Q2, Q2_opt, epsilon):
 
         if np.random.binomial(1, 1 - epsilon):
             # value_input = np.concatenate([np.array([obs] * 3), tf.one_hot([0, 1, 2], 3)], axis=1)
-            act = np.argmax(Q1(input.reshape(1,-1)) + Q2(input.reshape(1,-1)))
+            act = np.argmax(tf.nn.softmax(Q1(input.reshape(1,-1))) + tf.nn.softmax(Q2(input.reshape(1,-1))))
             #act = tf.random.categorical(tf.math.softmax(Q1(obs.reshape(1, -1)) + Q2(obs.reshape(1, -1))), 1).numpy()[0][
             #    0]
         else:
@@ -74,71 +75,81 @@ def train_step(Q1, Q1_opt, Q2, Q2_opt, epsilon):
 
         if done:
             if obs[0] >= 0.5: print('Final location: {}'.format(obs[0]))
-            with tf.GradientTape() as tape:
-                # if episode is over, record info about episode
-                ep_ret, ep_len = sum(ep_rews), len(ep_rews)
-                batch_rets.append(ep_ret)
-                batch_lens.append(ep_len)
 
-                #phi_input = np.concatenate([np.array(ep_obs), tf.one_hot(ep_acts, 3)], axis = 1)
-                phi_1 = Q1(np.array(ep_obs), training=True)
-                phi_2 = Q2(np.array(ep_obs), training=True)
+            # if episode is over, record info about episode
+            ep_ret, ep_len = sum(ep_rews), len(ep_rews)
+            batch_rets.append(ep_ret)
+            batch_lens.append(ep_len)
+            batch_rews.append(ep_rews)
+            batch_obs.append(ep_obs)
+            batch_acts.append(ep_acts)
+            batch_velocity.append(np.mean(ep_velocity))
+            iteration += len(ep_obs)
 
-                if which_network:
-                    # targets can be static...
-                    # the discounted return
-                    G = n_step_G(ep_rews, cfg.td_steps, cfg.discount_rate)
-                    # if we have not reached the top by end of episode, append action value estimate, otherwise append 0
-                    extra = phi_2[-1][np.argmax(phi_1[-1])] if(obs[0] < 0.5) else 0
+            # reset episode-specific variables
+            obs, done, = env.reset(), False
+            ep_rews, ep_obs, ep_acts, ep_velocity = [], [], [], []
 
-                    # if we are not done, then Q is the n-step-ahead action value function output ...
-                    # ... otherwise it is the value of extra
-                    Q = [cfg.discount_rate ** cfg.td_steps * phi_2[j+cfg.td_steps][np.argmax(phi_1[j+cfg.td_steps])]
-                         if j+cfg.td_steps<len(phi_1)
-                         else cfg.discount_rate ** (len(phi_1) - j) * extra
-                         for j in range(len(phi_1))]
+            # end experience loop if we have enough of it
+            if iteration > cfg.batch_size:
+                # print(len(batch_obs))
+                break
 
-                    # form the full targets
-                    td_targets = np.array(G) + np.array(Q)
+    with tf.GradientTape(persistent = True) as tape:
+        for k, ep_obs, ep_rews, ep_acts in zip(range(len(batch_obs)), batch_obs, batch_rews, batch_acts):
+            # phi_input = np.concatenate([np.array(ep_obs), tf.one_hot(ep_acts, 3)], axis = 1)
+            ep_len = len(ep_obs)
+            phi_1 = Q1(np.array(ep_obs), training=True)
+            phi_2 = Q2(np.array(ep_obs), training=True)
 
-                    # values must be linked by backprop, are they?
-                    # td_values = tf.reduce_sum(phi_2*tf.one_hot(ep_acts, 3),axis=1)[:-1]
-                    td_values = [phi_1[j][ep_acts[j]] for j in range(len(ep_rews))]
-                    value_func_loss = tf.losses.MeanSquaredError()(td_targets, td_values)
-                    collect_Q1_loss += value_func_loss
+            which_network = np.random.binomial(1, 0.5) # switch which network we are updating
 
-                    grads = tape.gradient(value_func_loss, Q1.trainable_variables)
-                    Q1_opt.apply_gradients(zip(grads, Q1.trainable_variables))
-                else:
-                    G = n_step_G(ep_rews, cfg.td_steps, cfg.discount_rate)
-                    extra = phi_1[-1][np.argmax(phi_2[-1])] if (obs[0] < 0.5) else 0
+            if which_network:
+                # targets can be static...
+                # the discounted return
+                G = n_step_G(ep_rews, cfg.td_steps, cfg.discount_rate)
+                # if we have not reached the top by end of episode, append action value estimate, otherwise append 0
+                extra = phi_2[-1][np.argmax(phi_1[-1])] if (obs[0] < 0.5) else 0
 
-                    Q = [cfg.discount_rate ** cfg.td_steps * phi_1[j + cfg.td_steps][np.argmax(phi_2[j + cfg.td_steps])]
-                         if j + cfg.td_steps < len(phi_2)
-                         else cfg.discount_rate ** (len(phi_2) - j) * extra
-                         for j in range(len(phi_2))]
-                    td_targets = np.array(G) + np.array(Q)
+                # if we are not done, then Q is the n-step-ahead action value function output ...
+                # ... otherwise it is the value of 'extra'
+                Q_ = [phi_2[j + cfg.td_steps][np.argmax(phi_1[j + cfg.td_steps])] if j + cfg.td_steps < ep_len
+                      else 0
+                      for j in range(ep_len)]
+                Q = [cfg.discount_rate ** cfg.td_steps * q if j + cfg.td_steps < ep_len
+                     else cfg.discount_rate ** (ep_len - j) * extra
+                     for j, q in enumerate(Q_)]
 
-                    td_values = [phi_2[j][ep_acts[j]] for j in range(len(ep_rews))]
-                    value_func_loss = tf.losses.MeanSquaredError()(td_targets, td_values)
-                    collect_Q2_loss += value_func_loss
+                # form the full targets
+                td_targets = np.array(G) + np.array(Q)
 
-                    grads = tape.gradient(value_func_loss, Q2.trainable_variables)
-                    Q2_opt.apply_gradients(zip(grads, Q2.trainable_variables))
+                # values must be linked (allow backprop), are they?
+                # td_values = tf.reduce_sum(phi_2*tf.one_hot(ep_acts, 3),axis=1)[:-1]
+                td_values = [phi_1[j][ep_acts[j]] for j in range(ep_len)]
+                value_func_loss = tf.losses.MeanSquaredError()(td_targets, td_values)
+                collect_Q1_loss += value_func_loss
+            else:
+                G = n_step_G(ep_rews, cfg.td_steps, cfg.discount_rate)
+                extra = phi_1[-1][np.argmax(phi_2[-1])] if (obs[0] < 0.5) else 0
 
-                iteration += len(ep_obs)
-                batch_acts += ep_acts
-                batch_velocity.append(np.mean(ep_velocity))
+                Q_ = [phi_1[j + cfg.td_steps][np.argmax(phi_2[j + cfg.td_steps])] if j + cfg.td_steps < ep_len
+                      else 0
+                      for j in range(ep_len)]
+                Q = [cfg.discount_rate ** cfg.td_steps * q if j + cfg.td_steps < ep_len
+                     else cfg.discount_rate ** (ep_len - j) * extra
+                     for j, q in enumerate(Q_)]
 
-                # reset episode-specific variables
-                obs, done, = env.reset(), False
-                ep_rews, ep_obs, ep_acts, ep_velocity = [], [], [], []
-                which_network = not which_network
+                td_targets = np.array(G) + np.array(Q)
 
-                # end experience loop if we have enough of it
-                if iteration > cfg.batch_size:
-                    # print(len(batch_obs))
-                    break
+                td_values = [phi_2[j][ep_acts[j]] for j in range(ep_len)]
+                value_func_loss = tf.losses.MeanSquaredError()(td_targets, td_values)
+                collect_Q2_loss += value_func_loss
+
+    Q1_grads = tape.gradient(collect_Q1_loss, Q1.trainable_variables)
+    Q1_opt.apply_gradients(zip(Q1_grads, Q1.trainable_variables))
+
+    Q2_grads = tape.gradient(collect_Q2_loss, Q2.trainable_variables)
+    Q2_opt.apply_gradients(zip(Q2_grads, Q2.trainable_variables))
 
     return({'Q1_loss': collect_Q1_loss,
             'Q2_loss': collect_Q2_loss,

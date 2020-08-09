@@ -33,8 +33,8 @@ ptilings = []
 vtilings = []
 
 for i in range(num_tilings):
-    ptiling = np.linspace(plow - pstep*i/(num_tilings-1), phigh + pstep*(1-i/(num_tilings-1)), num_tilings)
-    vtiling = np.linspace(vlow - vstep*i/(num_tilings-1), vhigh + vstep*(1-i/(num_tilings-1)), num_tilings)
+    ptiling = np.linspace(plow - pstep*i/(num_tilings-1), phigh + pstep*(1-i/(num_tilings-1)), pos_bins)
+    vtiling = np.linspace(vlow - vstep*i/(num_tilings-1), vhigh + vstep*(1-i/(num_tilings-1)), speed_bins)
     ptilings.append(ptiling)
     vtilings.append(vtiling)
 
