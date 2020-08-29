@@ -1,79 +1,110 @@
+import sys, os, re, datetime, time, itertools, argparse
+sys.path.append("..")
+
 from config import Config as cfg
 from utils import *
+from tf_models import acrobot_mlp
 
 import tensorflow as tf
 import gym
 import numpy as np
-import datetime
-import itertools
 
-# tensorflow nonsense
-physical_devices = tf.config.experimental.list_physical_devices(device_type = "GPU")
-tf.config.experimental.set_memory_growth(physical_devices[0], True)
+from mlflow import log_metric, log_param, log_artifacts
 
-#
+# import pdb
+
+# set up acrobot
 env = gym.make('Acrobot-v1')
-
-num_tilings = 48
-
-tilings = [[] for _ in range(num_tilings)]
-bins = [6]*4
-sub_obs = [0,2,4,5]
-
-steps = []
-for i in sub_obs:
-    high = env.observation_space.high[i]
-    low = env.observation_space.low[i]
-    steps.append((high - low)/(num_tilings/4-1))
-
-for i in reversed(range(4)):
-    sub_tilings = itertools.combinations(sub_obs, i+1)
-    for st in sub_tilings:
-        for k, j in enumerate(st):
-            tmp_tiling = np.linspace(env.observation_space.low[j] - steps[k] * i / (num_tilings - 1), \
-                                     env.observation_space.high[j] + steps[k] * (1 - i / (num_tilings - 1)),
-                                    bins[k])
-            tilings[i].append(tmp_tiling)
-
-for t in tilings:
-
-for i, t in enumerate(tilings[0]):
-    tmp_obs = obs[sub_obs]
-    if(i == 0):
-        out_arr = discretize(tmp_obs[i], t)
-    else:
-        out_arr = np.outer(out_arr, discretize(tmp_obs[i], t)).reshape(-1)
-
-
-
-
+obs = env.reset()
 n_acts = env.action_space.n
-obs_dim = env.observation_space.shape[0]
 
-# define network, just a linear combination of the flattened tilings
-Q1 = mlp(obs_dim, [144, n_acts], dropout=None, use_bias=True, activation = tf.nn.sigmoid)
+obs_dim = 4 # we will convert from 6 dimensional to 4 dimensional observation space using convert_to_angle()
+#cos(theta1), sin(theta1), cos(theta2), sin(theta2), ang1, ang2
+
+# number of tilings per combination
+# From Sutton et al. (1996):  3 tilings for each of the 4 variables, 2 tilings for each of 6 combinations of 2 variables\
+# ... 3 tilings for the 4 combinations of 3 variables, and 12 tilings for the 4 variable combination
+num_tilings = [3,2,3,12]
+bins = [6]*4
+sub_obs = [0,2,4,5] # just used to construct the steps for tilings
+
+# manually do this since the implementation in the paper has 6 variables
+obs_space_high = [np.pi, np.pi, env.observation_space.high[4], env.observation_space.high[5]]
+obs_space_low = [-np.pi, -np.pi, env.observation_space.low[4], env.observation_space.low[5]]
+
+# function to convert the 6 variable observation to 4 variables
+def convert_to_angle(obs):
+    phi1 = np.arctan2(obs[1], obs[0])
+    phi2 = np.arctan2(obs[3], obs[2])
+    return [phi1, phi2, obs[4], obs[5]]
+
+### get the step size for each tiling ###
+# the equation is (high-low)/num_bins/num_tilings for each tiling
+steps = []
+for nt in num_tilings:
+    tmp_steps = []
+    for i in sub_obs:
+        if i in [4,5]:
+            high = env.observation_space.high[i]
+            low = env.observation_space.low[i]
+        else:
+            high = np.pi
+            low = -np.pi
+        tmp_steps.append((high - low)/6/nt)
+    steps.append(tmp_steps)
+
+### create the tilings as described in Sutton et al. (1996)
+tilings = [[] for _ in range(4)]
+# i + 1 here will be the number of variables used
+for i, stp, nt in zip(range(len(steps)), steps, num_tilings):
+    # this different combinations of variables used
+    sub_tilings = itertools.combinations(range(4), i + 1)
+
+    # for each combination
+    for st in sub_tilings:
+        # number of tilings per combination
+        for l in range(nt):
+            # for each index in the state space
+            for k, j in enumerate(st):
+                # tilings shifted by the step parameter
+                tmp_tiling = np.linspace(obs_space_low[j] - stp[k] * l, \
+                                         obs_space_high[j] + stp[k] * (nt-l-1),
+                                         bins[k])
+                tilings[i].append({"variable_set":st,"variable":j, "tiling_space": tmp_tiling})
+
+'''
+Create the correct input for our network.
+
+Input is a set of tilings for each set of variables and an observation converted to [angle1, angle2, angv1, angv2]
+
+output is length 4 list element.  [1-tuple-tilings, 2-tuple-tilings, 3-tuple-tilings, 4-tuple-tilings]
+
+'''
+def make_input(tilings, obs):
+    input_vector = []
+
+    for nvars in range(4):
+        out_arrs = []
+        for i, t in enumerate(tilings[nvars]):
+            if(i % (nvars+1) == 0):
+                tmp_arr = discretize(obs[t['variable']], t['tiling_space'])
+            else:
+                tmp_arr = np.outer(tmp_arr, discretize(obs[t['variable']], t['tiling_space'])).reshape(-1)
+
+            if((i + 1) % (nvars+1) == 0):
+                out_arrs.append(tmp_arr)
+
+        input_vector.append(np.concatenate(out_arrs).reshape(1, -1))
+
+    return(input_vector)
+
+# define network, the dimensions are from from Sutton et al. (1996)
+# Q1 = mlp(18648, [n_acts], dropout=None, use_bias=False, activation=None) # old mlp
+Q1 = acrobot_mlp(sizes=[12*6, 12*6**2], n_acts=3, activations=[tf.nn.sigmoid, tf.nn.sigmoid], \
+                 use_bias=False)
 
 # ...and optimizer
-Q1_opt = tf.optimizers.Adam(learning_rate=cfg.learning_rate)
-
-# set up tensorboard
-current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-train_log_dir = 'logs/' + current_time + '/train'
-tb = tf.summary.create_file_writer(train_log_dir)
-
-# returns the flattened tiling representation of an observation
-def get_tiling_input(ptilings, vtilings, obs):
-    pos_input = []
-    for tiling in ptilings:
-        pos_input.append(discretize(obs[0], tiling))
-
-    speed_input = []
-    for tiling in vtilings:
-        speed_input.append(discretize(obs[1], tiling))
-
-    input = np.concatenate([np.outer(p, v).reshape(-1) for p, v in zip(pos_input, speed_input)])
-
-    return input
+Q1_opt = tf.optimizers.SGD(learning_rate=cfg.learning_rate)
 
 #
 def train_step(Q1, Q1_opt, epsilon, epoch):
@@ -86,7 +117,7 @@ def train_step(Q1, Q1_opt, epsilon, epoch):
     '''
 
     # Initialization for batch.  Batch contains multiple episodes:
-    collect_Q1_loss = 0 # loss for Q1 and Q2
+    collect_Q1_loss = 0 # loss for Q1
     iteration = 0 # for logging
     batch_acts = []  # store actions
     batch_rews = []  # store rewards
@@ -94,54 +125,60 @@ def train_step(Q1, Q1_opt, epsilon, epoch):
     batch_rets = []  # store episode returns
     batch_lens = []  # store episode lengths
     batch_speed = [] # store the absolute speed over the train step
+    batch_completions = 0 # how many times did we reach the top?
 
     # reset episode-specific variables
-    obs = env.reset()  # first obs comes from starting distribution
+    obs = env.reset() # first obs comes from starting distribution
     done = False  # signal from environment that episode is over
     ep_rews = []  # list for rewards accrued throughout ep
     ep_obs = [] # every flattened state representation
     ep_acts = [] #
     ep_speed = [] #
 
+    # pdb.set_trace()
+
     while not done:
         # the time step (t) in the book
         step = 0 # this resets on episode end, iteration doesn't
 
         # get initial input
-        input = np.array(obs)
-        ep_obs.append(input.copy().reshape(1,-1))
+        input = make_input(tilings, convert_to_angle(obs))
+        ep_obs.append(input.copy())
 
         tau = -1 # the time step being updated, intialize to nonsense value
 
         # initial action
         if np.random.binomial(1, 1 - epsilon):
-            act = np.argmax(Q1(input.reshape(1,-1)))
+            act = np.argmax(Q1(input))
         else:
             act = env.action_space.sample()
         ep_acts.append(act)
 
+        # initialize eligibility_trace
+        eligibility_trace = None
+
         # generate an episode
         while tau != len(ep_acts) - 1:
             if done:
-                ep_complete = -np.cos(env.state[0]) - np.cos(env.state[1] + env.state[0]) > 1.
-                if ep_complete: # episode ended because we reached the top
-                    print('top reached')
-                else: # episode ended because we reached the time limit
+                if not ep_complete: # episode ended because we reached the time limit
                     # this is so that there is an observation at tau + td_steps that we can compute the Q-value of
-                    input = np.array(obs)
-                    ep_obs.append(input.copy().reshape(1, -1))
+                    input = make_input(tilings, convert_to_angle(obs))
+                    ep_obs.append(input.copy())
             else:
                 obs, rew, done, _ = env.step(act)  # take action, observe new state and reward
                 ep_rews.append(rew)  # store next reward
                 ep_speed.append(np.abs(obs[-2])) # store speed for logging
 
                 # store next state
-                input = np.array(obs)
-                ep_obs.append(input.copy().reshape(1,-1))
+                input = make_input(tilings, convert_to_angle(obs))
+                ep_obs.append(input.copy())
 
                 # only get next action if we are not in terminal state
                 if not done:
-                    act = np.argmax(Q1(input.reshape(1,-1)))
+                    if np.random.binomial(1, 1 - epsilon):
+                        act = np.argmax(Q1(input))
+                    else:
+                        act = env.action_space.sample()
                     ep_acts.append(act)
 
                 ep_complete = False
@@ -172,18 +209,37 @@ def train_step(Q1, Q1_opt, epsilon, epoch):
                     value_func_loss = tf.losses.MeanSquaredError()(target[np.newaxis], phi)
                     collect_Q1_loss += value_func_loss
 
+                # debugging
+                if np.isnan(value_func_loss):
+                    pdb.set_trace()
+
+                # compute gradient
                 Q1_grads = tape.gradient(value_func_loss, Q1.trainable_variables)
-                Q1_opt.apply_gradients(zip(Q1_grads, Q1.trainable_variables))
+
+                # create eligibility trace
+                if not eligibility_trace:
+                    eligibility_trace = Q1_grads
+                else:
+                    eligibility_trace = [cur + cfg.discount_rate * cfg.trace_decay * prev for cur, prev in
+                                         zip(Q1_grads, eligibility_trace)]
+                    eligibility_trace = [tf.clip_by_norm(g, 4)for g in eligibility_trace]
+
+                # apply eligibility trace
+                Q1_opt.apply_gradients(zip(eligibility_trace, Q1.trainable_variables))
+
+            # did we reach the top or just run out of time?
+            if done:
+                ep_complete = -np.cos(env.state[0]) - np.cos(env.state[1] + env.state[0]) > 1.
 
             step += 1
             iteration += 1
 
         # tensorboard
-        with tb.as_default():
-            tf.summary.histogram('weights', Q1.layers[1].weights[0], step=cfg.batch_size*epoch + iteration)
-            tf.summary.histogram('grads', Q1_grads[0], step=cfg.batch_size*epoch + iteration)
-
-        tb.flush()
+        # with tb.as_default():
+        #     tf.summary.histogram('weights', Q1.layers[1].weights[0], step=cfg.batch_size*epoch + iteration)
+        #     tf.summary.histogram('grads', Q1_grads[0], step=cfg.batch_size*epoch + iteration)
+        #
+        # tb.flush()
         #
 
         # if episode is over, record info about episode
@@ -194,6 +250,7 @@ def train_step(Q1, Q1_opt, epsilon, epoch):
         batch_obs.append(ep_obs)
         batch_acts.append(ep_acts)
         batch_speed.append(np.mean(ep_speed))
+        batch_completions += ep_complete
 
         # reset episode-specific variables
         obs, done, = env.reset(), False
@@ -208,43 +265,59 @@ def train_step(Q1, Q1_opt, epsilon, epoch):
             'batch_acts':batch_acts,
             'batch_rets':batch_rets,
             'batch_lens':batch_lens,
+            'batch_completions': batch_completions,
             'average_speed':np.mean(batch_speed)
             })
 
+if __name__ == "__main__":
+    current_time = datetime.datetime.now().strftime("%Y%m%d-%H%M")
 
-# training loop
-for i in range(cfg.epochs):
-    epsilon = epsilon=max(cfg.explore_0*cfg.explore_decay**i, cfg.min_explore)
-    res = train_step(Q1, Q1_opt, epsilon=epsilon, epoch=i)
-    print('Epoch {}: Q1 loss: {}, Avg Reward: {}, Avg ep len: {}, Avg speed: {}'.format(
-        i, res['Q1_loss'], np.sum(res['batch_rets'])/len(res['batch_rets']),
-        np.sum(res['batch_lens']) / len(res['batch_lens']), res['average_speed']))
-#
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--train", action="store_true")
+    parser.add_argument("--test", action="store_true")
+    parser.add_argument("--logdir", type=str, default=os.path.join('logs/TD_N_acrobot_', current_time))
+    args = parser.parse_args()
 
-### inspect the performance of the agent:
-import time
-obs = env.reset()  # first obs comes from starting distribution
-done = False  # signal from environment that episode is over
+    os.makedirs(args.logdir)
+    # tb = tf.summary.create_file_writer(train_log_dir)
 
-for i in range(10):
-    while not done:
-        pos_input = []
-        for tiling in ptilings:
-            pos_input.append(discretize(obs[0], tiling))
+    # mlflow logging
+    cfgparams = [el for el in cfg.__dict__.keys() if not re.search("__", el)]
+    for k in cfgparams:
+        log_param(k, cfg.__dict__[k])
 
-        speed_input = []
-        for tiling in vtilings:
-            speed_input.append(discretize(obs[1], tiling))
+    if(args.train):
+        # training loop
+        for i in range(cfg.epochs):
+            epsilon = max(cfg.explore_0*cfg.explore_decay**i, cfg.min_explore) - cfg.min_explore
+            res = train_step(Q1, Q1_opt, epsilon=epsilon, epoch=i)
+            print('Epoch {}: Q1 loss: {}, Avg Reward: {}, Avg ep len: {}, Avg speed: {}, completions: {}'.format(
+                i, res['Q1_loss'], np.sum(res['batch_rets'])/len(res['batch_rets']),
+                np.sum(res['batch_lens']) / len(res['batch_lens']), res['average_speed'], res['batch_completions']))
 
-        input = np.concatenate([np.outer(p, v).reshape(-1) for p, v in zip(pos_input, speed_input)])
-        # value_input = np.concatenate([np.array([obs] * 3), tf.one_hot([0, 1, 2], 3)], axis=1)
-        act = np.argmax(Q1(input.reshape(1,-1)))
-        # act = tf.random.categorical(tf.math.softmax(Q1(obs.reshape(1, -1)) + Q2(obs.reshape(1, -1))), 1).numpy()[0][0]
-        obs, rew, done, _ = env.step(act)
-        env.render()
-        time.sleep(0.01)
+            log_metric('batch completions', res['batch_completions'], step=i)
+            log_metric('average ep len', res['average_speed'], step=i)
 
-    done = False
-    obs = env.reset()
+        artifacts_dir = os.path.join(args.logdir, "artifacts")
+        os.makedirs(artifacts_dir)
+        Q1.save_weights(os.path.join(artifacts_dir, "final_model.ckpt"))
+        log_artifacts(artifacts_dir)
 
-env.close()
+    ### inspect the performance of the agent:
+    if(args.test):
+        obs = env.reset()
+        done = False
+
+        for i in range(5):
+            while not done:
+                # create input, take action, step, render
+                input = make_input(tilings, convert_to_angle(obs))
+                act = np.argmax(Q1(input))
+                obs, rew, done, _ = env.step(act)
+                env.render()
+                time.sleep(0.01)
+
+            done = False
+            obs = env.reset()
+
+        env.close()
