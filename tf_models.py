@@ -5,7 +5,7 @@ class acrobot_mlp(tf.keras.Model):
     super().__init__()
     self.linears = [tf.keras.layers.Dense(size, activation=activation, **kwargs) \
                     for size, activation in zip(sizes, activations)]
-    self.dense_out = tf.keras.layers.Dense(n_acts, output_activation, **kwargs)
+    self.dense_out = tf.keras.layers.Dense(n_acts, output_activation, use_bias=False)
 
   def call(self, inputs):
     # hidden activations for the 1-variable and 2-variable inputs

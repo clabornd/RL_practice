@@ -26,9 +26,9 @@ obs_dim = 4 # we will convert from 6 dimensional to 4 dimensional observation sp
 # ... 3 tilings for the 4 combinations of 3 variables, and 12 tilings for the 4 variable combination
 num_tilings = [3,2,3,12]
 bins = [6]*4
-sub_obs = [0,2,4,5] # just used to construct the steps for tilings
+sub_obs = [0,2,4,5]
 
-# manually do this since the implementation in the paper has 6 variables
+# manually do this since the implementation in the paper has
 obs_space_high = [np.pi, np.pi, env.observation_space.high[4], env.observation_space.high[5]]
 obs_space_low = [-np.pi, -np.pi, env.observation_space.low[4], env.observation_space.low[5]]
 
@@ -100,17 +100,14 @@ def make_input(tilings, obs):
 
 # define network, the dimensions are from from Sutton et al. (1996)
 # Q1 = mlp(18648, [n_acts], dropout=None, use_bias=False, activation=None) # old mlp
-# sizes = [12*6/2, 12*6**2/2]
-# activations = [tf.nn.sigmoid, tf.nn.sigmoid]
-sizes = []
-activations = []
-Q1 = acrobot_mlp(sizes=sizes, n_acts=3, activations=activations)
+Q1 = acrobot_mlp(sizes=[12*6, 12*6**2], n_acts=3, activations=[tf.nn.sigmoid, tf.nn.sigmoid], \
+                 use_bias=False)
 
 # ...and optimizer
 Q1_opt = tf.optimizers.SGD(learning_rate=cfg.learning_rate)
 
 #
-def train_step(Q1, Q1_opt, epsilon, epoch, agg_fn = tf.reduce_mean):
+def train_step(Q1, Q1_opt, epsilon, epoch):
     '''
     :param Q1:  First function approximator for the action value function
     :param Q1_opt: Optimizer for the first function approximator
@@ -138,17 +135,14 @@ def train_step(Q1, Q1_opt, epsilon, epoch, agg_fn = tf.reduce_mean):
     ep_acts = [] #
     ep_speed = [] #
 
-    # pdb.set_trace()
+    pdb.set_trace()
 
     while not done:
         # the time step (t) in the book
         step = 0 # this resets on episode end, iteration doesn't
 
-        #
-        ep_complete = False
-
         # get initial input
-        input = [make_input(tilings, convert_to_angle(obs))[-1]]
+        input = make_input(tilings, convert_to_angle(obs))
         ep_obs.append(input.copy())
 
         tau = -1 # the time step being updated, intialize to nonsense value
@@ -166,9 +160,13 @@ def train_step(Q1, Q1_opt, epsilon, epoch, agg_fn = tf.reduce_mean):
         # generate an episode
         while tau != len(ep_acts) - 1:
             if done:
+                pdb.set_trace()
+                ep_complete = -np.cos(env.state[0]) - np.cos(env.state[1] + env.state[0]) > 1.
+                if ep_complete:
+                    pdb.set_trace()
                 if not ep_complete: # episode ended because we reached the time limit
                     # this is so that there is an observation at tau + td_steps that we can compute the Q-value of
-                    input = [make_input(tilings, convert_to_angle(obs))[-1]]
+                    input = make_input(tilings, convert_to_angle(obs))
                     ep_obs.append(input.copy())
             else:
                 obs, rew, done, _ = env.step(act)  # take action, observe new state and reward
@@ -176,7 +174,7 @@ def train_step(Q1, Q1_opt, epsilon, epoch, agg_fn = tf.reduce_mean):
                 ep_speed.append(np.abs(obs[-2])) # store speed for logging
 
                 # store next state
-                input = [make_input(tilings, convert_to_angle(obs))[-1]]
+                input = make_input(tilings, convert_to_angle(obs))
                 ep_obs.append(input.copy())
 
                 # only get next action if we are not in terminal state
@@ -186,8 +184,8 @@ def train_step(Q1, Q1_opt, epsilon, epoch, agg_fn = tf.reduce_mean):
                     else:
                         act = env.action_space.sample()
                     ep_acts.append(act)
-                else:
-                    ep_complete = -np.cos(env.state[0]) - np.cos(env.state[1] + env.state[0]) > 1.
+
+                ep_complete = False
 
             ## Begin update ##
 
@@ -195,17 +193,16 @@ def train_step(Q1, Q1_opt, epsilon, epoch, agg_fn = tf.reduce_mean):
 
             if(tau >= 0):
                 # observed discounted rewards
-                # TODO:  Give n_step_G option to return just single value
                 G = n_step_G(ep_rews[tau:], cfg.td_steps, cfg.discount_rate)[0]
 
                 # if we have not reached end of episode, append the Q-value at time tau + td_steps ...
                 if not done:
-                    extra = cfg.discount_rate ** cfg.td_steps * agg_fn(Q1(ep_obs[tau + cfg.td_steps]))
+                    extra = cfg.discount_rate ** cfg.td_steps * tf.reduce_mean(Q1(ep_obs[tau + cfg.td_steps]))
                 # otherwise append the last observed action value (ep_obs is end-padded with the last observation \
                 # such that ep_obs[tau + cfg.td_steps] references at actual value if we are past the terminal time point
                 else:
                     discount = cfg.discount_rate ** (len(ep_obs) - tau)
-                    extra = agg_fn(Q1(ep_obs[tau + cfg.td_steps]))*discount if not ep_complete else 0
+                    extra = tf.reduce_mean(Q1(ep_obs[tau + cfg.td_steps]))*discount if not ep_complete else 0
 
                 target = G + extra
 
@@ -216,14 +213,11 @@ def train_step(Q1, Q1_opt, epsilon, epoch, agg_fn = tf.reduce_mean):
                     value_func_loss = tf.losses.MeanSquaredError()(target[np.newaxis], phi)
                     collect_Q1_loss += value_func_loss
 
-                # debugging
                 if np.isnan(value_func_loss):
                     pdb.set_trace()
 
-                # compute gradient
                 Q1_grads = tape.gradient(value_func_loss, Q1.trainable_variables)
 
-                # create eligibility trace
                 if not eligibility_trace:
                     eligibility_trace = Q1_grads
                 else:
@@ -231,13 +225,10 @@ def train_step(Q1, Q1_opt, epsilon, epoch, agg_fn = tf.reduce_mean):
                                          zip(Q1_grads, eligibility_trace)]
                     eligibility_trace = [tf.clip_by_norm(g, 4)for g in eligibility_trace]
 
-                # apply eligibility trace
                 Q1_opt.apply_gradients(zip(eligibility_trace, Q1.trainable_variables))
 
-            # did we reach the top or just run out of time?
             if done:
-                ep_complete = -np.cos(env.state[0]) - np.cos(env.state[1] + env.state[0]) > 1.
-
+                print('hi')
             step += 1
             iteration += 1
 
@@ -282,7 +273,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--test", action="store_true")
-    parser.add_argument("--logdir", type=str, default=os.path.join('logs/TD_N_acrobot', current_time))
+    parser.add_argument("--logdir", type=str, default=os.path.join('logs/TD_N_acrobot_', current_time))
     args = parser.parse_args()
 
     os.makedirs(args.logdir)
@@ -297,7 +288,7 @@ if __name__ == "__main__":
         # training loop
         for i in range(cfg.epochs):
             epsilon = max(cfg.explore_0*cfg.explore_decay**i, cfg.min_explore) - cfg.min_explore
-            res = train_step(Q1, Q1_opt, epsilon=epsilon, epoch=i, agg_fn=eval(cfg.agg_fn))
+            res = train_step(Q1, Q1_opt, epsilon=epsilon, epoch=i)
             print('Epoch {}: Q1 loss: {}, Avg Reward: {}, Avg ep len: {}, Avg speed: {}, completions: {}'.format(
                 i, res['Q1_loss'], np.sum(res['batch_rets'])/len(res['batch_rets']),
                 np.sum(res['batch_lens']) / len(res['batch_lens']), res['average_speed'], res['batch_completions']))
@@ -318,7 +309,7 @@ if __name__ == "__main__":
         for i in range(5):
             while not done:
                 # create input, take action, step, render
-                input = [make_input(tilings, convert_to_angle(obs))[-1]]
+                input = make_input(tilings, convert_to_angle(obs))
                 act = np.argmax(Q1(input))
                 obs, rew, done, _ = env.step(act)
                 env.render()
